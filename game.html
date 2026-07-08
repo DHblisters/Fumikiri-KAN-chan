@@ -1,0 +1,747 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ふみきり カンカン</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;
+    font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
+    -webkit-tap-highlight-color:transparent;touch-action:manipulation;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  #c{background:#000;display:block;box-shadow:0 0 40px rgba(0,0,0,.6);}
+  #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+    color:#fff;font-size:14px;opacity:.0;transition:opacity .4s;pointer-events:none;
+    text-shadow:0 2px 6px rgba(0,0,0,.8);}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="hint">画面をタップ！</div>
+<script>
+"use strict";
+//========================= 基本設定 =========================
+const RW = 1536, RH = 1024;                 // 内部レンダリング解像度
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+canvas.width = RW; canvas.height = RH;
+
+let DEBUG = false;                          // デバッグ格子（g キーで切替）
+
+//========================= アセット =========================
+const A = {};   // key -> Image
+function loadImg(key, src){
+  return new Promise(res=>{
+    const im = new Image();
+    im.onload = ()=>{ A[key]=im; res(true); };
+    im.onerror = ()=>{ console.warn('load fail', src); res(false); };
+    im.src = src;
+  });
+}
+
+// 車両画像のベイク済み計測値（roof=屋根線, rail=レール線, metric=屋根〜レール, cl/cr=車体左右端）
+const CAR = {
+  'n700s_head': {w:2072,h:333,rail:326,roof:12,metric:314,cl:6,cr:2065},
+  'n700s_mid':  {w:2172,h:396,rail:389,roof:20,metric:369,cl:78,cr:2084},
+  'n700s_tail': {w:2172,h:335,rail:328,roof:12,metric:316,cl:69,cr:2101},
+  'komachi_head':{w:1818,h:331,rail:324,roof:13,metric:311,cl:6,cr:1811},
+  'komachi_mid': {w:2036,h:380,rail:373,roof:6, metric:367,cl:6,cr:2029},
+  'komachi_tail':{w:1986,h:345,rail:338,roof:12,metric:326,cl:6,cr:1979},
+  'e235_head':  {w:2311,h:472,rail:465,roof:17,metric:448,cl:6,cr:2304},
+  'e235_mid':   {w:1818,h:405,rail:398,roof:22,metric:376,cl:6,cr:1811},
+  'e235_tail':  {w:1808,h:387,rail:380,roof:16,metric:364,cl:6,cr:1801},
+  'keihan_head':{w:2242,h:464,rail:457,roof:43,metric:414,cl:6,cr:2235},
+  'keihan_mid': {w:2383,h:412,rail:405,roof:41,metric:364,cl:6,cr:2376},
+  'keihan_tail':{w:1749,h:384,rail:377,roof:37,metric:340,cl:6,cr:1742},
+  'd51_loco':   {w:2035,h:470,rail:463,roof:50,metric:413,cl:6,cr:2028},
+  'd51_coach':  {w:2019,h:463,rail:456,roof:6, metric:450,cl:6,cr:2012},
+};
+
+// 列車定義（画像はすべて左向き＝右→左方向がデフォルト）。全て5両編成。
+const TRAINS = [
+  {id:'n700s',   label:'新幹線 N700S',            head:'n700s_head',  mid:'n700s_mid',  tail:'n700s_tail',  kind:'shinkansen', speed:1300, chimney:null},
+  {id:'komachi', label:'秋田新幹線 こまち',         head:'komachi_head',mid:'komachi_mid',tail:'komachi_tail',kind:'shinkansen', speed:1250, chimney:null},
+  {id:'e235',    label:'JR山手線 E235系',          head:'e235_head',   mid:'e235_mid',   tail:'e235_tail',   kind:'commuter',   speed:1080, chimney:null},
+  {id:'keihan',  label:'京阪電車 600系',           head:'keihan_head', mid:'keihan_mid', tail:'keihan_tail', kind:'commuter',   speed:980,  chimney:null},
+  {id:'d51',     label:'蒸気機関車 D51',           head:'d51_loco',    mid:'d51_coach',  tail:'d51_coach',   kind:'steam',      speed:820,  chimney:{x:372,y:70}},
+];
+// ※ JR中央線 E233系0番台 / 大阪メトロ70系 は画像素材が届き次第ここに追加します。
+
+// シーン定義（切替順は仕様通り）。各座標は 1536x1024 の内部座標。
+// nearBar は左支柱から右へ(side:'L')、farBar は右支柱から左へ(side:'R')倒れる。
+// 設備配置の共通部分（遮断棒・路面コピー枠）。警報灯(lampL/lampR)と方向指示器(arrow)は
+// 背景アートごとに実位置が微妙に異なるため、各シーンで実測値を個別指定する。
+const LAND = {   // 原風景/都市/ジャングル/砂漠 は遮断棒配置が共通
+  trackY:806, bodyPx:232,
+  nearBar:{pivx:352, pivy:772, len:1062, thick:20, side:'L'},
+  farBar :{pivx:1138, pivy:689, len:648, thick:10, side:'R'},
+  rmNear :{x:338, y:747, w:1096, h:50, dy:80},
+  rmFar  :{x:486, y:675, w:664, h:28, dy:40},
+};
+function land(extra){ return Object.assign(JSON.parse(JSON.stringify(LAND)), extra); }
+// lampL/lampR: x=灯中心x, y1=上灯中心y, y2=下灯中心y, r=レンズ半径（背景の点灯部から採寸）
+// arrow.t=「→」矢印, arrow.b=「←」矢印 の外接矩形（背景の赤矢印から採寸）
+const SCENES = [
+  land({key:'scene0_nihon',  name:'日本の原風景',
+    lampL:{x:335, y1:319, y2:418, r:31}, lampR:{x:1137, y1:479, y2:540, r:20},
+    arrow:{t:{x:204,y:506,w:68,h:40}, b:{x:247,y:538,w:49,h:32}} }),
+  land({key:'scene1_city',   name:'現代的な大都市',
+    lampL:{x:339, y1:329, y2:433, r:31}, lampR:{x:1150, y1:498, y2:564, r:22},
+    arrow:{t:{x:209,y:518,w:69,h:36}, b:{x:253,y:546,w:50,h:33}} }),
+  land({key:'scene2_jungle', name:'東南アジアのジャングル',
+    lampL:{x:335, y1:336, y2:437, r:31}, lampR:{x:1138, y1:494, y2:558, r:21},
+    arrow:{t:{x:202,y:524,w:52,h:32}, b:{x:247,y:556,w:60,h:32}} }),
+  land({key:'scene3_desert', name:'エジプトの砂漠',
+    lampL:{x:337, y1:326, y2:428, r:31}, lampR:{x:1139, y1:496, y2:554, r:22},
+    arrow:{t:{x:206,y:513,w:65,h:36}, b:{x:249,y:542,w:48,h:32}} }),
+  { key:'scene4_sea', name:'海底',
+    trackY:786, bodyPx:210,
+    nearBar:{pivx:410, pivy:748, len:610, thick:16, side:'L'},
+    farBar :{pivx:1092, pivy:690, len:610, thick:10, side:'R'},
+    rmNear :{x:398, y:726, w:640, h:44, dy:60},
+    rmFar  :{x:482, y:678, w:620, h:26, dy:36},
+    lampL:{x:402, y1:556, y2:616, r:27}, lampR:{x:1126, y1:547, y2:610, r:24},
+    arrow:{t:{x:304,y:652,w:41,h:30}, b:{x:324,y:679,w:48,h:30}} },
+  { key:'scene5_moon', name:'月面',
+    trackY:820, bodyPx:215,
+    nearBar:{pivx:420, pivy:800, len:560, thick:16, side:'L'},
+    farBar :{pivx:1078, pivy:729, len:600, thick:10, side:'R'},
+    rmNear :{x:408, y:778, w:585, h:44, dy:58},
+    rmFar  :{x:474, y:714, w:610, h:26, dy:36},
+    lampL:{x:410, y1:588, y2:650, r:28}, lampR:{x:1094, y1:591, y2:651, r:27},
+    arrow:{t:{x:314,y:690,w:70,h:40}, b:{x:345,y:722,w:80,h:38}} },
+];
+
+//========================= シーン描画(cover) =========================
+// 背景を内部キャンバスに cover 配置するための変換を計算
+function coverParams(img){
+  const s = Math.max(RW/img.naturalWidth, RH/img.naturalHeight);
+  const w = img.naturalWidth*s, h = img.naturalHeight*s;
+  return {s, dx:(RW-w)/2, dy:(RH-h)/2, w, h};
+}
+function drawScene(img){
+  const p = coverParams(img);
+  ctx.drawImage(img, p.dx, p.dy, p.w, p.h);
+  return p;
+}
+
+//========================= 列車 組み立て/描画 =========================
+// 5両を左→右（先頭が左＝左向き）に連結。戻り値: {cars:[{key,scale,drawX,railY}], width}
+function buildTrain(train, bodyPx){
+  const keys = [train.head, train.mid, train.mid, train.mid, train.tail];
+  const overlap = 3;
+  let cursor = 0;
+  const cars = [];
+  for(const k of keys){
+    const m = CAR[k];
+    const s = bodyPx / m.metric;                 // 車体高さを揃えるスケール
+    const drawX = cursor - m.cl*s;               // 画像左端の配置x（cl が cursor に来るよう）
+    cars.push({key:k, s, drawX});
+    cursor += (m.cr - m.cl)*s - overlap;
+  }
+  return {cars, width:cursor};
+}
+// 列車を screen に描画。ox=編成左端の画面x, dir=+1(右進/反転) or -1(左進)
+function drawTrain(train, asm, ox, trackY, dir, tSmoke){
+  ctx.save();
+  if(dir>0){ ctx.translate(ox+asm.width, 0); ctx.scale(-1,1); ctx.translate(-ox, 0); }
+  for(const car of asm.cars){
+    const m = CAR[car.key];
+    const dw = m.w*car.s, dh = m.h*car.s;
+    const dx = ox + car.drawX;
+    const dy = trackY - m.rail*car.s;
+    ctx.drawImage(A[car.key], dx, dy, dw, dh);
+  }
+  ctx.restore();
+}
+
+//========================= 遮断機（可動バー） =========================
+// 下りている背景の遮断棒を、下の路面をコピーして隠す（座標はキャンバス座標）
+function eraseBakedBar(rm){
+  if(!rm) return;
+  ctx.drawImage(canvas, rm.x, rm.y+rm.dy, rm.w, rm.h, rm.x, rm.y, rm.w, rm.h);
+}
+// 縞バーを描画。cfg={pivx,pivy,len,thick,side}, barP=0(上/開)..1(下/閉)
+// 背景アートの遮断桿に合わせた琥珀黄＋濃灰縞＋赤帯・光沢・陰影。
+function drawBar(cfg, barP){
+  const len=cfg.len, h=cfg.thick;
+  const up = -80*Math.PI/180;
+  ctx.save();
+  ctx.translate(cfg.pivx,cfg.pivy);
+  if(cfg.side==='R') ctx.scale(-1,1);
+  ctx.rotate(up*(1-barP));
+  // 影
+  ctx.fillStyle='rgba(0,0,0,.20)';
+  ctx.beginPath(); roundRect(3, h*0.5, len, h*0.7, h*0.35); ctx.fill();
+  // 黄地（縦グラデ：上ハイライト→琥珀→下陰）
+  const yg=ctx.createLinearGradient(0,-h/2,0,h/2);
+  yg.addColorStop(0,'#fff2c0'); yg.addColorStop(0.22,'#ffd21e');
+  yg.addColorStop(0.62,'#f4c00c'); yg.addColorStop(1,'#c68500');
+  ctx.fillStyle=yg; ctx.beginPath(); roundRect(0,-h/2,len,h,h*0.42); ctx.fill();
+  // 縞（黒＝濃灰／赤）を本体内にクリップして描画
+  ctx.save(); ctx.beginPath(); roundRect(0,-h/2,len,h,h*0.42); ctx.clip();
+  const seg=h*1.9;
+  const blk=ctx.createLinearGradient(0,-h/2,0,h/2);
+  blk.addColorStop(0,'#4c4d4f'); blk.addColorStop(0.5,'#333436'); blk.addColorStop(1,'#1c1d1f');
+  const red=ctx.createLinearGradient(0,-h/2,0,h/2);
+  red.addColorStop(0,'#e8544a'); red.addColorStop(0.5,'#d42625'); red.addColorStop(1,'#9c1414');
+  let i=0;
+  for(let x=seg*1.6;x<len-seg*0.5;x+=seg*2){
+    // 赤帯は先端寄り・根元寄り・中ほどに
+    const near=(x>len-seg*3.2)||(x<seg*2.6)|| (i===Math.floor((len/(seg*2))/2));
+    ctx.fillStyle = near ? red : blk;
+    ctx.fillRect(x,-h/2,seg,h); i++;
+  }
+  // 光沢ハイライト
+  ctx.fillStyle='rgba(255,255,255,.4)'; ctx.fillRect(0,-h/2+h*0.10,len,h*0.14);
+  ctx.restore();
+  // 縁取り
+  ctx.strokeStyle='rgba(15,15,15,.5)'; ctx.lineWidth=Math.max(1,h*0.10);
+  ctx.beginPath(); roundRect(0,-h/2,len,h,h*0.42); ctx.stroke();
+  ctx.restore();
+  drawPivot(cfg);
+}
+// 遮断機の付け根（支点ヒンジ機構）。回転しない前景として描く。
+function drawPivot(cfg){
+  const r=Math.max(9, cfg.thick*0.95);
+  ctx.save(); ctx.translate(cfg.pivx,cfg.pivy);
+  if(cfg.side==='R') ctx.scale(-1,1);
+  // 取付ブラケット（後方へ伸びる腕）
+  ctx.fillStyle='#26272b';
+  ctx.beginPath(); roundRect(-r*1.5,-r*0.7, r*1.7, r*1.4, 3); ctx.fill();
+  // 支点の円盤（金属ヒンジ）
+  const g=ctx.createRadialGradient(-r*0.3,-r*0.3,1,0,0,r*1.05);
+  g.addColorStop(0,'#7a7c82'); g.addColorStop(0.55,'#45464a'); g.addColorStop(1,'#161719');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(0,0,r,0,7); ctx.fill();
+  ctx.strokeStyle='#0e0e10'; ctx.lineWidth=Math.max(1.5,r*0.16); ctx.stroke();
+  // ボルト
+  ctx.fillStyle='#9a9ca2'; ctx.beginPath(); ctx.arc(0,0,r*0.34,0,7); ctx.fill();
+  ctx.strokeStyle='#3a3a3e'; ctx.lineWidth=1.5; ctx.stroke();
+  for(let k=0;k<4;k++){ const a=k*Math.PI/2+0.6; ctx.fillStyle='#2c2c30';
+    ctx.beginPath(); ctx.arc(Math.cos(a)*r*0.66,Math.sin(a)*r*0.66,r*0.11,0,7); ctx.fill(); }
+  ctx.restore();
+}
+function roundRect(x,y,w,h,r){
+  r=Math.min(r,w/2,h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+//========================= 方向指示器の矢印 =========================
+// 警報灯（赤ランプ）。lit=点灯なら赤く光らせ、消灯なら背景に焼き込まれた赤い点灯部を
+// 暗いレンズで確実に覆い隠す（ハロー漏れも含めて隠すため r*1.3 まで暗色で塗る）。
+function drawLamp(x,y,r,lit){
+  ctx.save();
+  if(lit){
+    ctx.globalCompositeOperation='lighter';
+    const g=ctx.createRadialGradient(x,y,1,x,y,r*1.8);
+    g.addColorStop(0,'rgba(255,90,62,0.98)'); g.addColorStop(0.40,'rgba(255,32,22,0.72)'); g.addColorStop(1,'rgba(255,0,0,0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r*1.8,0,7); ctx.fill();
+    ctx.globalCompositeOperation='source-over';
+    ctx.fillStyle='rgba(255,120,95,0.95)'; ctx.beginPath(); ctx.arc(x,y,r*0.60,0,7); ctx.fill();
+    ctx.fillStyle='rgba(255,215,200,0.95)'; ctx.beginPath(); ctx.arc(x-r*0.16,y-r*0.16,r*0.24,0,7); ctx.fill();
+  } else {
+    // 消灯レンズ：レンズ径に密着した不透明の暗色で焼き込み赤を隠す。
+    // 外周フェードは狭く保ち、明るい背景（海/月）上で大きな暗い滲みにならないようにする。
+    const g=ctx.createRadialGradient(x-r*0.22,y-r*0.22,1,x,y,r*1.16);
+    g.addColorStop(0,'rgba(36,12,10,0.995)'); g.addColorStop(0.70,'rgba(20,7,6,0.98)');
+    g.addColorStop(0.90,'rgba(14,6,6,0.72)'); g.addColorStop(1,'rgba(12,5,5,0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r*1.16,0,7); ctx.fill();
+  }
+  ctx.restore();
+}
+// 1本の支柱の2灯を上下交互点滅。on=作動中, phase=0で上灯/1で下灯。
+// 背景アートは常に「上灯=点灯(赤)/下灯=消灯(暗)」で焼き込まれている。よって
+//  ・上灯: 点灯フェーズ以外は暗レンズで焼き込み赤を隠す（二重発光を防ぐ）
+//  ・下灯: 点灯フェーズのみ発光。消灯時は元々暗いので何も描かない（暗い塊の滲みを避ける）
+function drawLamps(cfg, phase, on){
+  if(!cfg) return;
+  drawLamp(cfg.x, cfg.y1, cfg.r, on && phase===0);
+  if(on && phase===1) drawLamp(cfg.x, cfg.y2, cfg.r, true);
+}
+
+// 矢印グリフのパス（右向き基準・原点中心）
+function arrowPath(hw,hh,headW,shaftH){
+  const tip=hw, back=hw-headW;
+  ctx.beginPath();
+  ctx.moveTo(-hw,-shaftH/2); ctx.lineTo(back,-shaftH/2); ctx.lineTo(back,-hh);
+  ctx.lineTo(tip,0); ctx.lineTo(back,hh); ctx.lineTo(back,shaftH/2); ctx.lineTo(-hw,shaftH/2);
+  ctx.closePath();
+}
+// 矢印1本を発光描画。bx=外接矩形, dir>0で「→」/ dir<0で「←」
+function drawArrowGlyph(bx,dir){
+  const cx=bx.x+bx.w/2, cy=bx.y+bx.h/2, hw=bx.w/2, hh=bx.h/2;
+  const headW=Math.min(bx.w*0.52, bx.h*0.98), shaftH=bx.h*0.42;
+  ctx.save();
+  ctx.translate(cx,cy);
+  if(dir<0) ctx.scale(-1,1);
+  // 発光ハロー（加算）
+  ctx.save();
+  ctx.globalCompositeOperation='lighter';
+  ctx.shadowColor='rgba(255,45,32,0.95)'; ctx.shadowBlur=16;
+  ctx.fillStyle='rgba(255,70,52,0.85)'; arrowPath(hw,hh,headW,shaftH); ctx.fill();
+  ctx.shadowBlur=0; ctx.restore();
+  // 本体（明るい赤グラデ）
+  const g=ctx.createLinearGradient(0,-hh,0,hh);
+  g.addColorStop(0,'#ff8f77'); g.addColorStop(0.5,'#ff2c20'); g.addColorStop(1,'#d20e07');
+  ctx.fillStyle=g; arrowPath(hw,hh,headW,shaftH); ctx.fill();
+  // ハイライト
+  ctx.fillStyle='rgba(255,226,216,0.5)'; arrowPath(hw*0.9,hh*0.5,headW*0.82,shaftH*0.42); ctx.fill();
+  ctx.restore();
+}
+// 指示器の1矢印領域を暗色で覆い、背景に焼き込まれた赤矢印を消す（消灯状態を作る）
+function darkenArrow(bx){
+  ctx.save();
+  ctx.fillStyle='rgba(8,8,11,0.95)';
+  ctx.beginPath(); roundRect(bx.x-2,bx.y-2,bx.w+4,bx.h+4, 5); ctx.fill();
+  ctx.restore();
+}
+// 方向指示器：まず両矢印を暗色で覆って消灯させ、作動中は進行方向側だけを発光描画する。
+function drawIndicator(cfg, dir, on){
+  if(!cfg||!cfg.t||!cfg.b) return;
+  darkenArrow(cfg.t); darkenArrow(cfg.b);
+  if(on){
+    if(dir>0) drawArrowGlyph(cfg.t, +1);   // → 右進行
+    else      drawArrowGlyph(cfg.b, -1);   // ← 左進行
+  }
+}
+
+//========================= 煙（D51） =========================
+let smoke = [];
+function emitSmoke(x,y,dir){
+  const grey = 90+Math.random()*70;           // 出たては濃く、後で薄く
+  smoke.push({x:x+(Math.random()*16-8), y:y+(Math.random()*10-5),
+    vx:dir*-26 + (Math.random()*26-13), vy:-70-Math.random()*45,
+    r:16+Math.random()*14, life:0, max:2.4+Math.random()*1.4, g:grey});
+}
+function updateSmoke(dt){
+  for(const p of smoke){ p.life+=dt; p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy*=0.985; p.vx*=0.99;
+    p.r+=40*dt; p.g=Math.min(210,p.g+34*dt); }   // 上昇しながら拡散・退色
+  smoke = smoke.filter(p=>p.life<p.max);
+  if(smoke.length>200) smoke.splice(0,smoke.length-200);
+}
+function drawSmoke(){
+  for(const p of smoke){
+    const k=p.life/p.max;
+    const a = Math.max(0, 0.6*(1-k)*(1-k));
+    const g = ctx.createRadialGradient(p.x,p.y,1,p.x,p.y,p.r);
+    g.addColorStop(0,'rgba('+(p.g|0)+','+(p.g|0)+','+(p.g|0)+','+a+')');
+    g.addColorStop(0.6,'rgba('+(p.g|0)+','+(p.g|0)+','+(p.g|0)+','+(a*0.4)+')');
+    g.addColorStop(1,'rgba('+(p.g|0)+','+(p.g|0)+','+(p.g|0)+',0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,7); ctx.fill();
+  }
+}
+
+//========================= オーディオ（mp3効果音） =========================
+// HTMLAudioElement を使用（file:// ダブルクリック起動でも再生可能）。
+let muted=false;
+const SND={};
+function loadAudio(key,src,loop){
+  const a=new Audio(src); a.loop=!!loop; a.preload='auto';
+  a.addEventListener('error',()=>console.warn('audio load fail',src));
+  try{ a.load(); }catch(e){}
+  SND[key]=a;
+}
+function sndPlay(key){
+  const a=SND[key]; if(!a) return;
+  a.muted=muted;
+  try{ a.currentTime=0; }catch(e){}
+  const p=a.play(); if(p&&p.catch) p.catch(()=>{});
+}
+function sndStop(key){ const a=SND[key]; if(!a) return; a.pause(); try{a.currentTime=0;}catch(e){} }
+function stopTrainSounds(){ sndStop('shinkansen'); sndStop('train'); sndStop('steam_run'); sndStop('steam_hiss'); }
+function applyMute(){ for(const k in SND){ SND[k].muted=muted; } if(!muted) startBgm(); }
+// BGM one-click start: loop from the first user gesture, retrying only if the browser rejects play().
+const BGM_VOL=0.5;
+let bgmPlayPending=false;
+let bgmStarted=false;
+function startBgm(){
+  const a=SND['bgm']; if(!a) return Promise.resolve(false);
+  if(muted || document.hidden) return Promise.resolve(false);
+  a.loop=true; a.volume=BGM_VOL; a.muted=false;
+  if(!a.paused){ bgmStarted=true; return Promise.resolve(true); }
+  if(bgmPlayPending) return Promise.resolve(false);
+  bgmPlayPending=true;
+  try{
+    const p=a.play();
+    if(p&&p.then){
+      return p.then(()=>{
+        bgmStarted=true; bgmPlayPending=false; return true;
+      }).catch(err=>{
+        bgmStarted=false; bgmPlayPending=false;
+        console.warn('bgm play retry later', err);
+        return false;
+      });
+    }
+    bgmStarted=true; bgmPlayPending=false; return Promise.resolve(true);
+  }catch(err){
+    bgmStarted=false; bgmPlayPending=false;
+    console.warn('bgm play retry later', err);
+    return Promise.resolve(false);
+  }
+}
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden){
+    for(const k in SND) SND[k].pause();
+  } else if(audioUnlocked){
+    if(!muted) startBgm();
+    if(typeof screen!=='undefined' && screen==='game'){
+      if(state!==ST.IDLE) sndPlay('crossing');
+      if(state===ST.PASS && curTrain) startPassSound(curTrain);
+    }
+  }
+});
+let audioUnlocked=false;
+function unlockAudio(){
+  startBgm();
+  audioUnlocked=true;
+}
+// Train pass sound start.
+function startPassSound(train){
+  if(train.kind==='shinkansen'){ sndPlay('shinkansen'); }
+  else if(train.kind==='steam'){ sndPlay('steam_run'); sndPlay('steam_hiss'); }
+  else { sndPlay('train'); }
+}
+
+//========================= 状態遷移 =========================
+const ST={IDLE:0,WARN:1,WAIT:2,PASS:3,CLEAR:4};
+let state=ST.IDLE, stateT=0, barP=0;
+let sceneIdx=0;
+let curTrain=null, curDir=-1, asm=null, lead=0, passStarted=false;
+let passDur=0, whistle1Done=false, whistle2Done=false;   // D51 汽笛（登場0.5秒後 / 退場0.5秒前）
+const BAR_DOWN_T=1.5, WAIT_T=2.0, BAR_UP_T=1.6;
+let nowT=0;
+let screen='title';                        // 'title'（START画面）| 'game'（本編）
+
+function tapStart(){
+  if(screen!=='game' || state!==ST.IDLE) return;
+  // ランダムに列車と方向を決定
+  curTrain = TRAINS[(Math.random()*TRAINS.length)|0];
+  curDir = Math.random()<0.5 ? -1 : 1;
+  const sc = SCENES[sceneIdx];
+  asm = buildTrain(curTrain, sc.bodyPx);
+  lead=0; passStarted=false; whistle1Done=false; whistle2Done=false;
+  state=ST.WARN; stateT=0;
+  hint.style.opacity=0;
+  sndPlay('crossing');           // 踏切警報音：降下開始〜完全上昇まで連続
+}
+
+function update(dt){
+  nowT+=dt;
+  updateSmoke(dt);
+
+  if(state===ST.WARN){
+    stateT+=dt; barP=Math.min(1, stateT/BAR_DOWN_T);
+    if(stateT>=BAR_DOWN_T){ state=ST.WAIT; stateT=0; barP=1; }
+  } else if(state===ST.WAIT){
+    stateT+=dt; barP=1;
+    if(stateT>=WAIT_T){ state=ST.PASS; stateT=0; passStarted=true;
+      passDur = (RW+asm.width)/curTrain.speed;      // 通過に要する秒数
+      startPassSound(curTrain);
+    }
+  } else if(state===ST.PASS){
+    stateT+=dt; barP=1;
+    lead += curTrain.speed*dt;
+    if(curTrain.kind==='steam'){
+      if(!whistle1Done && stateT>=0.5){ whistle1Done=true; sndPlay('steam_whistle'); }           // 登場0.5秒後
+      if(!whistle2Done && stateT>=Math.max(0.5,passDur-0.5)){ whistle2Done=true; sndPlay('steam_whistle'); } // 退場0.5秒前
+    }
+    if(lead>=RW+asm.width){ state=ST.CLEAR; stateT=0; stopTrainSounds(); }
+  } else if(state===ST.CLEAR){
+    stateT+=dt; barP=Math.max(0,1-stateT/BAR_UP_T);
+    if(stateT>=BAR_UP_T){ state=ST.IDLE; stateT=0; barP=0;
+      sndStop('crossing');                          // 遮断機が上がり切ったら警報音停止
+      startFlip(()=>{ sceneIdx=(sceneIdx+1)%SCENES.length; });   // 次の場面へ「絵本めくり」で遷移
+    }
+  }
+}
+
+//========================= 描画メイン =========================
+function render(){
+  const sc=SCENES[sceneIdx];
+  const bg=A[sc.key];
+  ctx.clearRect(0,0,RW,RH);
+  if(!bg){ return; }
+  const cover=drawScene(bg);
+
+  // 背景の遮断棒を隠す（開いた状態を作る）
+  eraseBakedBar(sc.rmFar);
+  eraseBakedBar(sc.rmNear);
+
+  const active=(state===ST.WARN||state===ST.WAIT||state===ST.PASS);
+
+  // 奥の遮断棒（列車の後ろ）
+  drawBar(sc.farBar, barP);
+
+  // 列車
+  if(state===ST.PASS){
+    const ox = curDir<0 ? (RW-lead) : (-asm.width+lead);
+    drawTrain(curTrain, asm, ox, sc.trackY, curDir, nowT);
+    // 煙（D51）
+    if(curTrain.kind==='steam' && curTrain.chimney){
+      const c0=asm.cars[0], m=CAR[c0.key];
+      const localX = c0.drawX + curTrain.chimney.x*c0.s;   // 編成内での煙突x
+      const scX = curDir<0 ? (ox+localX) : (ox+asm.width-localX);
+      const scY = sc.trackY - (m.rail - curTrain.chimney.y)*c0.s;
+      emitSmoke(scX,scY,curDir);
+      if(Math.random()<0.7) emitSmoke(scX,scY,curDir);
+    }
+  }
+  drawSmoke();
+
+  // 前景の踏切本体（警報機）を列車の手前に描く → 列車が奥を通過する表現に
+  const fgImg=A['fg_'+sc.key];
+  if(fgImg) ctx.drawImage(fgImg,0,0);
+
+  // 警報灯（上下交互点滅）＆方向指示ランプ。作動中＝遮断機が下り始め〜完全に上がるまで
+  const lampsOn = (state!==ST.IDLE);
+  const lampPhase = ((nowT/0.42)|0)%2;
+  drawLamps(sc.lampL, lampPhase, lampsOn);
+  drawLamps(sc.lampR, lampPhase, lampsOn);
+  drawIndicator(sc.arrow, curDir, lampsOn);
+
+  // 手前の遮断棒（列車の前）
+  drawBar(sc.nearBar, barP);
+
+  // UI
+  drawButton();
+  drawCaption(sc);
+  drawMute();
+
+  if(DEBUG) drawDebug(cover);
+}
+
+//========================= UI: ボタン・キャプション =========================
+const BTN={w:300};
+function btnRect(){
+  const im=A['tap_idle']; const w=BTN.w; const h= im? w*im.naturalHeight/im.naturalWidth : w;
+  return {x:RW/2-w/2, y:RH-h-24, w, h};
+}
+function drawButton(){
+  const idle = state===ST.IDLE;
+  const im = A[idle?'tap_idle':'tap_press'];
+  if(!im) return;
+  const r=btnRect();
+  ctx.save();
+  if(idle){ const pulse=1+0.03*Math.sin(nowT*3); ctx.translate(r.x+r.w/2,r.y+r.h/2); ctx.scale(pulse,pulse); ctx.translate(-(r.x+r.w/2),-(r.y+r.h/2)); }
+  ctx.globalAlpha = idle?1:0.96;
+  ctx.drawImage(im, r.x, r.y, r.w, r.h);
+  ctx.restore();
+}
+// ミュートボタン（右上）
+function muteRect(){ return {x:RW-92, y:26, w:64, h:64}; }
+function drawMute(){
+  const r=muteRect(), cx=r.x+r.w/2, cy=r.y+r.h/2;
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,.38)';
+  ctx.beginPath(); ctx.arc(cx,cy,r.w/2,0,7); ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,.25)'; ctx.lineWidth=2; ctx.stroke();
+  // スピーカー
+  ctx.fillStyle='#fff'; ctx.strokeStyle='#fff'; ctx.lineWidth=3;
+  ctx.beginPath();
+  ctx.moveTo(cx-14,cy-6); ctx.lineTo(cx-6,cy-6); ctx.lineTo(cx+2,cy-14);
+  ctx.lineTo(cx+2,cy+14); ctx.lineTo(cx-6,cy+6); ctx.lineTo(cx-14,cy+6); ctx.closePath(); ctx.fill();
+  if(muted){
+    ctx.strokeStyle='#ff5555'; ctx.lineWidth=4;
+    ctx.beginPath(); ctx.moveTo(cx-16,cy-16); ctx.lineTo(cx+18,cy+18); ctx.stroke();
+  } else {
+    ctx.lineWidth=3;
+    ctx.beginPath(); ctx.arc(cx+8,cy,7,-0.7,0.7); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx+8,cy,13,-0.7,0.7); ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawCaption(sc){
+  ctx.save();
+  ctx.textBaseline='middle';
+  // 列車名（通過中）
+  if(state===ST.PASS && curTrain){
+    ctx.font='700 40px sans-serif';
+    const t2=curTrain.label; const w2=ctx.measureText(t2).width;
+    ctx.fillStyle='rgba(0,0,0,.5)'; roundRect(RW/2-w2/2-26,96,w2+52,64,16); ctx.fill();
+    ctx.fillStyle='#ffe14d'; ctx.textAlign='center';
+    ctx.fillText(t2,RW/2,130); ctx.textAlign='left';
+  }
+  ctx.restore();
+}
+
+//========================= START画面 =========================
+// STARTボタンの配置（『STARTﾎﾞﾀﾝ配置ｲﾒｰｼﾞ』を基準に採寸。画面下部中央・道路上）
+const START_BTN={cx:770, cy:842, w:486};
+function startBtnRect(){
+  const im=A['start_btn']; const w=START_BTN.w;
+  const h = im ? w*im.naturalHeight/im.naturalWidth : w*0.42;
+  return {x:START_BTN.cx-w/2, y:START_BTN.cy-h/2, w, h};
+}
+function drawStartButton(){
+  const im=A['start_btn']; if(!im) return;
+  const r=startBtnRect();
+  ctx.save();
+  const pulse=1+0.035*Math.sin(nowT*3);      // ふわっと拍動
+  ctx.translate(r.x+r.w/2, r.y+r.h/2); ctx.scale(pulse,pulse); ctx.translate(-(r.x+r.w/2),-(r.y+r.h/2));
+  ctx.drawImage(im, r.x, r.y, r.w, r.h);
+  ctx.restore();
+}
+function renderTitle(){
+  ctx.clearRect(0,0,RW,RH);
+  const bg=A['start'];
+  if(bg) drawScene(bg);
+  drawStartButton();
+}
+// 画面の描画ディスパッチ（タイトル or 本編）
+function drawCurrent(){ if(screen==='title') renderTitle(); else render(); }
+
+//========================= 画面遷移（絵本のページめくり） =========================
+const flip={active:false, t:0, dur:0.8, onDone:null};
+let flipFrom=null, flipTo=null;
+function snapshot(cv){
+  if(!cv){ cv=document.createElement('canvas'); cv.width=RW; cv.height=RH; }
+  const c=cv.getContext('2d'); c.clearRect(0,0,RW,RH); c.drawImage(canvas,0,0);
+  return cv;
+}
+// applyChange で状態を切替え、切替前後の画面をスナップショットしてめくりアニメを開始
+function startFlip(applyChange, onDone){
+  if(flip.active) return;
+  flipFrom = snapshot(flipFrom);   // 切替前（現在の画面）
+  applyChange();
+  drawCurrent();                   // 切替後を本キャンバスへ描画
+  flipTo = snapshot(flipTo);       // 切替後
+  flip.active=true; flip.t=0; flip.onDone=onDone||null;
+  drawFlip(0);                     // 開始フレーム（切替前ページ全面）を描いてちらつき防止
+}
+// 左端を綴じ（背表紙）としてページが右端から左へめくれていく表現
+function drawFlip(t){
+  ctx.clearRect(0,0,RW,RH);
+  ctx.drawImage(flipTo,0,0);                 // めくった先のページ（下地）
+  const e = t<0.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2;   // easeInOut
+  const theta = e*Math.PI/2;
+  const cw = Math.max(1, RW*Math.cos(theta));         // めくれ中ページの見かけ幅
+  // めくれ中ページが落とす影（先ページ上）
+  const sh=ctx.createLinearGradient(cw,0,cw+110,0);
+  sh.addColorStop(0,'rgba(0,0,0,'+(0.34*(1-e))+')'); sh.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=sh; ctx.fillRect(cw,0,110,RH);
+  // めくれ中ページ本体（横方向に圧縮）
+  ctx.drawImage(flipFrom, 0,0,RW,RH, 0,0, cw, RH);
+  // ページの陰影（奥へ傾くほど右側を暗く）＋右端のハイライト（紙のエッジ）
+  const pg=ctx.createLinearGradient(0,0,cw,0);
+  pg.addColorStop(0,'rgba(0,0,0,0)');
+  pg.addColorStop(0.72,'rgba(0,0,0,'+(0.10+0.22*e)+')');
+  pg.addColorStop(1,'rgba(24,18,10,'+(0.30+0.35*e)+')');
+  ctx.fillStyle=pg; ctx.fillRect(0,0,cw,RH);
+  ctx.fillStyle='rgba(255,250,236,'+(0.40*Math.sin(e*Math.PI))+')';
+  ctx.fillRect(cw-3,0,3,RH);
+}
+
+//========================= デバッグ格子 =========================
+function drawDebug(cover){
+  ctx.save();
+  // 警報灯中心と方向指示器bboxの採寸確認マーカー（黄=灯, 水色=矢印）
+  const sc=SCENES[sceneIdx];
+  ctx.lineWidth=2;
+  for(const lc of [sc.lampL, sc.lampR]){ if(!lc) continue;
+    ctx.strokeStyle='rgba(255,220,0,.95)';
+    for(const yy of [lc.y1, lc.y2]){ ctx.beginPath(); ctx.arc(lc.x,yy,lc.r,0,7); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(lc.x-lc.r-4,yy); ctx.lineTo(lc.x+lc.r+4,yy); ctx.moveTo(lc.x,yy-lc.r-4); ctx.lineTo(lc.x,yy+lc.r+4); ctx.stroke(); }
+  }
+  if(sc.arrow){ ctx.strokeStyle='rgba(0,220,255,.95)';
+    for(const bx of [sc.arrow.t, sc.arrow.b]){ if(bx) ctx.strokeRect(bx.x,bx.y,bx.w,bx.h); }
+  }
+  ctx.strokeStyle='rgba(0,255,120,.35)'; ctx.fillStyle='rgba(0,255,120,.9)'; ctx.lineWidth=1; ctx.font='16px monospace';
+  for(let gx=0;gx<=RW;gx+=128){ ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,RH); ctx.stroke(); ctx.fillText(gx,gx+2,16); }
+  for(let gy=0;gy<=RH;gy+=128){ ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(RW,gy); ctx.stroke(); ctx.fillText(gy,2,gy+16); }
+  // マウス点
+  ctx.fillStyle='rgba(255,255,0,.95)';
+  ctx.beginPath(); ctx.arc(mouseP.x,mouseP.y,6,0,7); ctx.fill();
+  ctx.fillStyle='#000'; ctx.fillRect(mouseP.x+8,mouseP.y-20,120,22);
+  ctx.fillStyle='#0f0'; ctx.fillText(Math.round(mouseP.x)+','+Math.round(mouseP.y),mouseP.x+12,mouseP.y-4);
+  ctx.restore();
+}
+
+//========================= 入力/ループ =========================
+const hint=document.getElementById('hint');
+let mouseP={x:0,y:0};
+function toInternal(clientX,clientY){
+  const r=canvas.getBoundingClientRect();
+  return { x:(clientX-r.left)/r.width*RW, y:(clientY-r.top)/r.height*RH };
+}
+canvas.addEventListener('pointerdown',e=>{
+  const p=toInternal(e.clientX,e.clientY); mouseP=p;
+  if(DEBUG){ console.log('PT', Math.round(p.x), Math.round(p.y)); window.__pts=window.__pts||[]; window.__pts.push([Math.round(p.x),Math.round(p.y)]); return; }
+  if(flip.active) return;                       // 遷移中は操作無効
+  unlockAudio();                                // 初回タップで音源解錠
+  if(screen==='title'){
+    const r=startBtnRect();
+    if(p.x>=r.x && p.x<=r.x+r.w && p.y>=r.y && p.y<=r.y+r.h){
+      // STARTボタン → 絵本めくりで本編へ
+      startFlip(()=>{ screen='game'; sceneIdx=0; state=ST.IDLE; barP=0; },
+                ()=>{ hint.style.opacity=0.9; });
+    }
+    return;
+  }
+  const mr=muteRect();
+  if(p.x>=mr.x && p.x<=mr.x+mr.w && p.y>=mr.y && p.y<=mr.y+mr.h){ muted=!muted; applyMute(); return; }
+  tapStart();
+});
+canvas.addEventListener('pointermove',e=>{ mouseP=toInternal(e.clientX,e.clientY); });
+window.addEventListener('keydown',e=>{
+  if(e.key==='g'){ DEBUG=!DEBUG; }
+  if(e.key==='m'){ muted=!muted; applyMute(); }
+  if(e.key>='0'&&e.key<='5'){ if(screen==='game') sceneIdx=+e.key; }
+  if(e.key==='t'){ tapStart(); }
+});
+
+// 画面フィット
+function fit(){
+  const vw=window.innerWidth, vh=window.innerHeight;
+  const s=Math.min(vw/RW, vh/RH);
+  canvas.style.width=(RW*s)+'px'; canvas.style.height=(RH*s)+'px';
+}
+window.addEventListener('resize',fit); fit();
+
+let last=performance.now();
+function loop(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  if(flip.active){
+    nowT+=dt;
+    flip.t += dt/flip.dur;
+    if(flip.t>=1){ flip.active=false; const cb=flip.onDone; flip.onDone=null; drawCurrent(); if(cb) cb(); }
+    else drawFlip(flip.t);
+  } else if(screen==='game'){
+    update(dt); if(!flip.active) render();   // update内でめくり開始時は描画をめくりに委ねる
+  } else {                       // title
+    nowT+=dt; renderTitle();
+  }
+  requestAnimationFrame(loop);
+}
+
+//========================= 起動 =========================
+async function boot(){
+  const jobs=[];
+  for(const s of SCENES) jobs.push(loadImg(s.key,'assets/bg/'+s.key+'.webp'));
+  for(const s of SCENES) jobs.push(loadImg('fg_'+s.key,'assets/fg/'+s.key+'.webp'));
+  const trainKeys=new Set();
+  for(const t of TRAINS){ trainKeys.add(t.head); trainKeys.add(t.mid); trainKeys.add(t.tail); }
+  for(const k of trainKeys) jobs.push(loadImg(k,'assets/train/'+k+'.webp'));
+  jobs.push(loadImg('tap_idle','assets/ui/tap_idle.webp'));
+  jobs.push(loadImg('tap_press','assets/ui/tap_press.webp'));
+  jobs.push(loadImg('start','assets/bg/start.webp'));
+  jobs.push(loadImg('start_btn','assets/ui/start_btn.webp'));
+  // 効果音（mp3）
+  loadAudio('crossing',     'assets/audio/crossing.mp3',      true);
+  loadAudio('shinkansen',   'assets/audio/shinkansen.mp3',    true);
+  loadAudio('train',        'assets/audio/train.mp3',         true);
+  loadAudio('steam_run',    'assets/audio/steam_run.mp3',     true);
+  loadAudio('steam_hiss',   'assets/audio/steam_hiss.mp3',    true);
+  loadAudio('steam_whistle','assets/audio/steam_whistle.mp3', false);
+  loadAudio('bgm','assets/audio/bgm.mp3', true);   // 48kHz/mp3。低域カット＋中高域強調・正規化でスピーカー対応
+  await Promise.all(jobs);
+  screen='title'; hint.style.opacity=0;
+  // BGMは読込時には鳴らさない（開いただけ／放置タブで鳴り続けるのを防ぐ）。
+  // 最初の画面タップ（unlockAudio）で開始し、以降ゲームを閉じるまでループ再生。
+  requestAnimationFrame(loop);
+}
+boot();
+</script>
+</body>
+</html>
