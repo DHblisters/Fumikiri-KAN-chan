@@ -1,4 +1,4 @@
-const CACHE_NAME = 'fumikiri-kankan-v1';
+const CACHE_NAME = 'fumikiri-kankan-v2';
 const PRECACHE_URLS = [
   './',
   './index.html',

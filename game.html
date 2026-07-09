@@ -8,23 +8,28 @@
   html,body{margin:0;height:100%;background:#000;overflow:hidden;
     font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
     -webkit-tap-highlight-color:transparent;touch-action:manipulation;}
-  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
-  #c{background:#000;display:block;box-shadow:0 0 40px rgba(0,0,0,.6);}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000;}
+  #bgc{position:absolute;inset:0;width:100%;height:100%;display:block;background:#000;pointer-events:none;}
+  #c{position:relative;background:#000;display:block;box-shadow:0 0 40px rgba(0,0,0,.6);z-index:1;}
   #hint{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
     color:#fff;font-size:14px;opacity:.0;transition:opacity .4s;pointer-events:none;
     text-shadow:0 2px 6px rgba(0,0,0,.8);}
 </style>
 </head>
 <body>
-<div id="wrap"><canvas id="c"></canvas></div>
+<div id="wrap"><canvas id="bgc" aria-hidden="true"></canvas><canvas id="c"></canvas></div>
 <div id="hint">画面をタップ！</div>
 <script>
 "use strict";
 //========================= 基本設定 =========================
 const RW = 1536, RH = 1024;                 // 内部レンダリング解像度
+const wrap = document.getElementById('wrap');
+const bgCanvas = document.getElementById('bgc');
+const bgCtx = bgCanvas.getContext('2d');
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 canvas.width = RW; canvas.height = RH;
+let viewW = 1, viewH = 1, viewDpr = 1;
 
 let DEBUG = false;                          // デバッグ格子（g キーで切替）
 
@@ -123,6 +128,33 @@ function drawScene(img){
   const p = coverParams(img);
   ctx.drawImage(img, p.dx, p.dy, p.w, p.h);
   return p;
+}
+function drawCoverTo(targetCtx, img, w, h, overscan=0){
+  const areaW = w + overscan*2, areaH = h + overscan*2;
+  const s = Math.max(areaW/img.naturalWidth, areaH/img.naturalHeight);
+  const dw = img.naturalWidth*s, dh = img.naturalHeight*s;
+  targetCtx.drawImage(img, (w-dw)/2, (h-dh)/2, dw, dh);
+}
+function backdropImage(){
+  if(screen==='title') return A['start'];
+  const sc=SCENES[sceneIdx];
+  return sc ? A[sc.key] : null;
+}
+function drawViewportBackdrop(){
+  bgCtx.setTransform(viewDpr,0,0,viewDpr,0,0);
+  bgCtx.clearRect(0,0,viewW,viewH);
+  const bg=backdropImage();
+  if(!bg){
+    bgCtx.fillStyle='#000';
+    bgCtx.fillRect(0,0,viewW,viewH);
+    return;
+  }
+  bgCtx.save();
+  bgCtx.filter='blur(14px)';
+  drawCoverTo(bgCtx, bg, viewW, viewH, 18);
+  bgCtx.restore();
+  bgCtx.fillStyle='rgba(0,0,0,.22)';
+  bgCtx.fillRect(0,0,viewW,viewH);
 }
 
 //========================= 列車 組み立て/描画 =========================
@@ -461,6 +493,7 @@ function update(dt){
 function render(){
   const sc=SCENES[sceneIdx];
   const bg=A[sc.key];
+  drawViewportBackdrop();
   ctx.clearRect(0,0,RW,RH);
   if(!bg){ return; }
   const cover=drawScene(bg);
@@ -584,6 +617,7 @@ function drawStartButton(){
   ctx.restore();
 }
 function renderTitle(){
+  drawViewportBackdrop();
   ctx.clearRect(0,0,RW,RH);
   const bg=A['start'];
   if(bg) drawScene(bg);
@@ -612,6 +646,7 @@ function startFlip(applyChange, onDone){
 }
 // 左端を綴じ（背表紙）としてページが右端から左へめくれていく表現
 function drawFlip(t){
+  drawViewportBackdrop();
   ctx.clearRect(0,0,RW,RH);
   ctx.drawImage(flipTo,0,0);                 // めくった先のページ（下地）
   const e = t<0.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2;   // easeInOut
@@ -684,6 +719,12 @@ canvas.addEventListener('pointerdown',e=>{
   tapStart();
 });
 canvas.addEventListener('pointermove',e=>{ mouseP=toInternal(e.clientX,e.clientY); });
+wrap.addEventListener('pointerdown',e=>{
+  if(e.target===canvas) return;
+  if(DEBUG || flip.active) return;
+  unlockAudio();
+  if(screen==='game') tapStart();
+});
 window.addEventListener('keydown',e=>{
   if(e.key==='g'){ DEBUG=!DEBUG; }
   if(e.key==='m'){ muted=!muted; applyMute(); }
@@ -696,6 +737,12 @@ function fit(){
   const vw=window.innerWidth, vh=window.innerHeight;
   const s=Math.min(vw/RW, vh/RH);
   canvas.style.width=(RW*s)+'px'; canvas.style.height=(RH*s)+'px';
+  viewW=Math.max(1,Math.round(vw));
+  viewH=Math.max(1,Math.round(vh));
+  viewDpr=Math.min(window.devicePixelRatio||1,2);
+  bgCanvas.width=Math.round(viewW*viewDpr);
+  bgCanvas.height=Math.round(viewH*viewDpr);
+  drawViewportBackdrop();
 }
 window.addEventListener('resize',fit); fit();
 
